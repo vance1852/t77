@@ -1,0 +1,37 @@
+services:
+  db:
+    image: mysql:8.0
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: show_ticketing
+      MYSQL_USER: show
+      MYSQL_PASSWORD: show123
+    healthcheck:
+      test:
+        ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - db_data:/var/lib/mysql
+
+  app:
+    build: .
+    environment:
+      DB_NAME: show_ticketing
+      DB_USER: show
+      DB_PASSWORD: show123
+      DB_HOST: db
+      DB_PORT: "3306"
+      DJANGO_SECRET_KEY: "show-ticketing-admin-dev-secret-change-me"
+      ADMIN_USERNAME: "admin"
+      ADMIN_PASSWORD: "admin123"
+    ports:
+      - "7652:7652"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
