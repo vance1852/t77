@@ -59,9 +59,9 @@ class QuotaService:
         """
         动态调整配额（增加或减少）。
         delta > 0 增加，delta < 0 减少。
-        减少时不能少于已售+占用。
+        减少时不能少于已售+占用；增加时不能超过场次总座位数。
         """
-        quota = PerformanceQuota.objects.select_for_update().get(pk=quota_id)
+        quota = PerformanceQuota.objects.select_for_update().select_related("performance").get(pk=quota_id)
         new_allocated = quota.allocated + delta
 
         if new_allocated < quota.sold + quota.held:
@@ -71,6 +71,16 @@ class QuotaService:
 
         if new_allocated < 0:
             raise ValueError("配额不能为负")
+
+        if delta > 0:
+            other_quotas = PerformanceQuota.objects.filter(
+                performance=quota.performance
+            ).exclude(pk=quota.pk)
+            other_total = sum(q.allocated for q in other_quotas)
+            if other_total + new_allocated > quota.performance.total_seats:
+                raise ValueError(
+                    f"调整后总配额超出总座位数：其他配额{other_total}，本配额调至{new_allocated}，总座位{quota.performance.total_seats}"
+                )
 
         quota.allocated = new_allocated
         quota.save(update_fields=["allocated", "updated_at"])
@@ -105,10 +115,13 @@ class QuotaService:
         for hold in expired_holds:
             QuotaService._release_hold_internal(hold)
 
-        quota = PerformanceQuota.objects.select_for_update().get(
-            performance_id=performance_id,
-            channel_id=channel_id,
-        )
+        try:
+            quota = PerformanceQuota.objects.select_for_update().get(
+                performance_id=performance_id,
+                channel_id=channel_id,
+            )
+        except PerformanceQuota.DoesNotExist:
+            raise ValueError(f"该渠道在此场次未分配配额：channel_id={channel_id}, performance_id={performance_id}")
 
         if quota.available < quantity:
             raise ValueError(
@@ -205,10 +218,13 @@ class ChannelOrderService:
         if perf.remaining_seats < quantity:
             raise ValueError(f"库存不足：剩余{perf.remaining_seats}张，需要{quantity}张")
 
-        quota = PerformanceQuota.objects.select_for_update().get(
-            performance_id=performance_id,
-            channel_id=channel_id,
-        )
+        try:
+            quota = PerformanceQuota.objects.select_for_update().get(
+                performance_id=performance_id,
+                channel_id=channel_id,
+            )
+        except PerformanceQuota.DoesNotExist:
+            raise ValueError(f"该渠道在此场次未分配配额：channel_id={channel_id}, performance_id={performance_id}")
 
         if hold_token:
             hold = QuotaHold.objects.select_for_update().get(hold_token=hold_token)
@@ -268,18 +284,31 @@ class ChannelOrderService:
     def refund_channel_order(order_id, refund_quantity=None):
         """
         渠道退票。
-        回退库存、回退配额、冲回佣金。
+        支持部分退票：退票后如果还有剩余票，状态为 partially_refunded；
+        全部退完后状态为 refunded。
+        refunded_quantity 跟踪累计退票数。
+        退票时冲回对应的库存和配额，佣金按比例冲回。
         """
         order = ChannelOrder.objects.select_for_update().get(pk=order_id)
 
         if order.status == "refunded":
-            raise ValueError("订单已退票")
-        if order.status != "paid":
+            raise ValueError("订单已全额退票，无法继续退票")
+        if order.status not in ("paid", "partially_refunded"):
             raise ValueError(f"订单状态不允许退票：{order.status}")
 
-        refund_qty = refund_quantity if refund_quantity else order.quantity
-        if refund_qty > order.quantity:
-            raise ValueError("退票数量不能超过购票数量")
+        remaining_qty = order.quantity - order.refunded_quantity
+        if remaining_qty <= 0:
+            raise ValueError("订单无可退票数量")
+
+        if refund_quantity is None:
+            refund_qty = remaining_qty
+        else:
+            refund_qty = refund_quantity
+
+        if refund_qty <= 0:
+            raise ValueError("退票数量必须大于0")
+        if refund_qty > remaining_qty:
+            raise ValueError(f"退票数量超过剩余可退数量：剩余{remaining_qty}张，请求退{refund_qty}张")
 
         perf = Performance.objects.select_for_update().get(pk=order.performance_id)
         perf.sold_seats = max(0, perf.sold_seats - refund_qty)
@@ -296,14 +325,22 @@ class ChannelOrderService:
         refund_ticket_amount = order.ticket_amount * refund_ratio
         refund_commission_amount = order.commission_amount * refund_ratio
 
-        order.status = "refunded"
-        order.refunded_at = timezone.now()
-        order.ticket_amount = refund_ticket_amount
-        order.commission_amount = refund_commission_amount
-        order.quantity = refund_qty
-        order.save(update_fields=["status", "refunded_at", "ticket_amount", "commission_amount", "quantity"])
+        order.refunded_quantity += refund_qty
 
-        return order
+        if order.refunded_quantity >= order.quantity:
+            order.status = "refunded"
+        else:
+            order.status = "partially_refunded"
+
+        order.refunded_at = timezone.now()
+        order.save(update_fields=["status", "refunded_quantity", "refunded_at"])
+
+        return order, {
+            "refund_quantity": refund_qty,
+            "refund_ticket_amount": refund_ticket_amount,
+            "refund_commission_amount": refund_commission_amount,
+            "remaining_quantity": order.quantity - order.refunded_quantity,
+        }
 
 
 class SettlementService:
@@ -336,6 +373,12 @@ class SettlementService:
             created_at__date__gte=period_start,
             created_at__date__lte=period_end,
         )
+        partially_refunded_orders = ChannelOrder.objects.filter(
+            channel=channel,
+            status="partially_refunded",
+            created_at__date__gte=period_start,
+            created_at__date__lte=period_end,
+        )
         refunded_orders = ChannelOrder.objects.filter(
             channel=channel,
             status="refunded",
@@ -352,6 +395,31 @@ class SettlementService:
                 quantity=order.quantity,
                 ticket_amount=order.ticket_amount,
                 commission_amount=order.commission_amount,
+            ))
+            order.is_settled = True
+            order.settlement_statement = statement
+            order.save(update_fields=["is_settled", "settlement_statement"])
+
+        for order in partially_refunded_orders:
+            effective_qty = order.quantity - order.refunded_quantity
+            if effective_qty > 0:
+                effective_ratio = Decimal(effective_qty) / Decimal(order.quantity)
+                items.append(SettlementItem(
+                    statement=statement,
+                    order=order,
+                    item_type="sale",
+                    quantity=effective_qty,
+                    ticket_amount=order.ticket_amount * effective_ratio,
+                    commission_amount=order.commission_amount * effective_ratio,
+                ))
+            refund_ratio = Decimal(order.refunded_quantity) / Decimal(order.quantity)
+            items.append(SettlementItem(
+                statement=statement,
+                order=order,
+                item_type="refund",
+                quantity=order.refunded_quantity,
+                ticket_amount=-(order.ticket_amount * refund_ratio),
+                commission_amount=-(order.commission_amount * refund_ratio),
             ))
             order.is_settled = True
             order.settlement_statement = statement

@@ -394,7 +394,7 @@ class ChannelOrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def refund(self, request, pk=None):
-        """渠道退票（冲销佣金+回退配额）。"""
+        """渠道退票（冲销佣金+回退配额），支持部分退票。"""
         refund_quantity = request.data.get("refund_quantity")
         try:
             refund_qty = int(refund_quantity) if refund_quantity else None
@@ -402,14 +402,17 @@ class ChannelOrderViewSet(viewsets.ModelViewSet):
             refund_qty = None
 
         try:
-            order = ChannelOrderService.refund_channel_order(
+            order, refund_info = ChannelOrderService.refund_channel_order(
                 order_id=pk,
                 refund_quantity=refund_qty,
             )
         except (ValueError, ChannelOrder.DoesNotExist) as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(ChannelOrderSerializer(order).data)
+        return Response({
+            "order": ChannelOrderSerializer(order).data,
+            "refund_detail": refund_info,
+        })
 
 
 class SettlementStatementViewSet(viewsets.ModelViewSet):

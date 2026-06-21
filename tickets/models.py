@@ -280,6 +280,7 @@ class ChannelOrder(models.Model):
 
     STATUS_CHOICES = [
         ("paid", "已支付"),
+        ("partially_refunded", "部分退票"),
         ("refunded", "已退票"),
         ("cancelled", "已取消"),
     ]
@@ -290,10 +291,11 @@ class ChannelOrder(models.Model):
     customer_name = models.CharField(max_length=64, blank=True, default="")
     customer_phone = models.CharField(max_length=32, blank=True, default="")
     quantity = models.IntegerField(default=0)
+    refunded_quantity = models.IntegerField(default=0, help_text="累计已退票数量")
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     ticket_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     commission_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="paid")
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default="paid")
     hold_token = models.UUIDField(null=True, blank=True)
     is_settled = models.BooleanField(default=False, help_text="是否已结算")
     settlement_statement = models.ForeignKey(
@@ -353,15 +355,29 @@ class SettlementStatement(models.Model):
         )
 
         paid_orders = orders.filter(status="paid")
+        partially_refunded_orders = orders.filter(status="partially_refunded")
         refunded_orders = orders.filter(status="refunded")
 
         self.total_tickets = sum(o.quantity for o in paid_orders)
         self.total_ticket_amount = sum(o.ticket_amount for o in paid_orders)
         self.total_commission = sum(o.commission_amount for o in paid_orders)
 
-        self.refund_tickets = sum(o.quantity for o in refunded_orders)
-        self.refund_ticket_amount = sum(o.ticket_amount for o in refunded_orders)
-        self.refund_commission = sum(o.commission_amount for o in refunded_orders)
+        for o in partially_refunded_orders:
+            effective_qty = o.quantity - o.refunded_quantity
+            if effective_qty > 0:
+                effective_ratio = Decimal(effective_qty) / Decimal(o.quantity)
+                self.total_tickets += effective_qty
+                self.total_ticket_amount += o.ticket_amount * effective_ratio
+                self.total_commission += o.commission_amount * effective_ratio
+
+            refund_ratio = Decimal(o.refunded_quantity) / Decimal(o.quantity)
+            self.refund_tickets += o.refunded_quantity
+            self.refund_ticket_amount += o.ticket_amount * refund_ratio
+            self.refund_commission += o.commission_amount * refund_ratio
+
+        self.refund_tickets += sum(o.refunded_quantity for o in refunded_orders)
+        self.refund_ticket_amount += sum(o.ticket_amount for o in refunded_orders)
+        self.refund_commission += sum(o.commission_amount for o in refunded_orders)
 
         self.net_settlement_amount = (
             self.total_ticket_amount - self.total_commission

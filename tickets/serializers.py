@@ -159,19 +159,24 @@ class ChannelOrderSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source="get_status_display", read_only=True)
     channel_name = serializers.CharField(source="channel.name", read_only=True)
     show_title = serializers.CharField(source="performance.show.title", read_only=True)
+    remaining_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = ChannelOrder
         fields = [
             "id", "channel", "channel_name", "performance", "show_title",
             "channel_order_no", "customer_name", "customer_phone",
-            "quantity", "unit_price", "ticket_amount", "commission_amount",
+            "quantity", "refunded_quantity", "remaining_quantity",
+            "unit_price", "ticket_amount", "commission_amount",
             "status", "status_label", "is_settled", "created_at", "refunded_at",
         ]
         read_only_fields = [
             "id", "ticket_amount", "commission_amount", "status",
-            "is_settled", "created_at", "refunded_at",
+            "refunded_quantity", "is_settled", "created_at", "refunded_at",
         ]
+
+    def get_remaining_quantity(self, obj):
+        return obj.quantity - obj.refunded_quantity
 
 
 class ChannelOrderCreateSerializer(serializers.Serializer):
